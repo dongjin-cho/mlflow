@@ -16,7 +16,6 @@ XGBoost (native) format
 .. _scikit-learn API:
     https://xgboost.readthedocs.io/en/latest/python/python_api.html#module-xgboost.sklearn
 """
-from packaging.version import Version
 import os
 import shutil
 import json
@@ -32,6 +31,7 @@ from mlflow.models.model import MLMODEL_FILE_NAME
 from mlflow.models.signature import ModelSignature
 from mlflow.models.utils import _save_example
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.utils import _get_fully_qualified_class_name
 from mlflow.utils.environment import (
     _mlflow_conda_env,
     _validate_env_arguments,
@@ -45,13 +45,12 @@ from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
 from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.exceptions import MlflowException
-from mlflow.utils.annotations import experimental
 from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
 from mlflow.utils.arguments_utils import _get_arg_names
 from mlflow.utils.autologging_utils import (
     autologging_integration,
     safe_patch,
-    exception_safe_function,
+    picklable_exception_safe_function,
     get_mlflow_run_params_for_fn_args,
     INPUT_EXAMPLE_SAMPLE_ROWS,
     resolve_input_example_and_signature,
@@ -59,13 +58,6 @@ from mlflow.utils.autologging_utils import (
     ENSURE_AUTOLOGGING_ENABLED_TEXT,
     batch_metrics_logger,
     MlflowAutologgingQueueingClient,
-)
-
-# Pylint doesn't detect objects used in class keyword arguments (e.g., metaclass) and considers
-# `ExceptionSafeAbstractClass` as 'unused-import': https://github.com/PyCQA/pylint/issues/1630
-# To avoid this bug, disable 'unused-import' on this line.
-from mlflow.utils.autologging_utils import (  # pylint: disable=unused-import
-    ExceptionSafeAbstractClass,
 )
 
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
@@ -152,14 +144,19 @@ def save_model(
 
     # Save an XGBoost model
     xgb_model.save_model(model_data_path)
-
+    xgb_model_class = _get_fully_qualified_class_name(xgb_model)
     pyfunc.add_to_model(
         mlflow_model,
         loader_module="mlflow.xgboost",
         data=model_data_subpath,
         env=_CONDA_ENV_FILE_NAME,
     )
-    mlflow_model.add_flavor(FLAVOR_NAME, xgb_version=xgb.__version__, data=model_data_subpath)
+    mlflow_model.add_flavor(
+        FLAVOR_NAME,
+        xgb_version=xgb.__version__,
+        data=model_data_subpath,
+        model_class=xgb_model_class,
+    )
     mlflow_model.save(os.path.join(path, MLMODEL_FILE_NAME))
 
     if conda_env is None:
@@ -168,13 +165,17 @@ def save_model(
             # To ensure `_load_pyfunc` can successfully load the model during the dependency
             # inference, `mlflow_model.save` must be called beforehand to save an MLmodel file.
             inferred_reqs = mlflow.models.infer_pip_requirements(
-                path, FLAVOR_NAME, fallback=default_reqs,
+                path,
+                FLAVOR_NAME,
+                fallback=default_reqs,
             )
             default_reqs = sorted(set(inferred_reqs).union(default_reqs))
         else:
             default_reqs = None
         conda_env, pip_requirements, pip_constraints = _process_pip_requirements(
-            default_reqs, pip_requirements, extra_pip_requirements,
+            default_reqs,
+            pip_requirements,
+            extra_pip_requirements,
         )
     else:
         conda_env, pip_requirements, pip_constraints = _process_conda_env(conda_env)
@@ -255,10 +256,28 @@ def log_model(
 
 
 def _load_model(path):
-    import xgboost as xgb
+    """
+    Load Model Implementation.
 
-    model = xgb.Booster()
-    model.load_model(os.path.abspath(path))
+    :param path: Local filesystem path to
+                    the MLflow Model with the ``xgboost`` flavor (MLflow < 1.22.0) or
+                    the top-level MLflow Model directory (MLflow >= 1.22.0).
+    """
+    import importlib
+
+    model_dir = os.path.dirname(path) if os.path.isfile(path) else path
+    flavor_conf = _get_flavor_configuration(model_path=model_dir, flavor_name=FLAVOR_NAME)
+
+    # XGBoost models saved in MLflow >=1.22.0 have `model_class`
+    # in the XGBoost flavor configuration to specify its XGBoost model class.
+    # When loading models, we first get the XGBoost model from
+    # its flavor configuration and then create an instance based on its class.
+    model_class = flavor_conf.get("model_class", "xgboost.core.Booster")
+    xgb_model_path = os.path.join(model_dir, flavor_conf.get("data"))
+
+    module, cls = model_class.rsplit(".", maxsplit=1)
+    model = getattr(importlib.import_module(module), cls)()
+    model.load_model(xgb_model_path)
     return model
 
 
@@ -289,12 +308,11 @@ def load_model(model_uri, dst_path=None):
                      This directory must already exist. If unspecified, a local output
                      path will be created.
 
-    :return: An XGBoost model (an instance of `xgboost.Booster`_)
+    :return: An XGBoost model. An instance of either `xgboost.Booster`_ or XGBoost scikit-learn
+             models, depending on the saved model class specification.
     """
     local_model_path = _download_artifact_from_uri(artifact_uri=model_uri, output_path=dst_path)
-    flavor_conf = _get_flavor_configuration(model_path=local_model_path, flavor_name=FLAVOR_NAME)
-    xgb_model_file_path = os.path.join(local_model_path, flavor_conf.get("data", "model.xgb"))
-    return _load_model(path=xgb_model_file_path)
+    return _load_model(path=local_model_path)
 
 
 class _XGBModelWrapper:
@@ -304,10 +322,12 @@ class _XGBModelWrapper:
     def predict(self, dataframe):
         import xgboost as xgb
 
-        return self.xgb_model.predict(xgb.DMatrix(dataframe))
+        if isinstance(self.xgb_model, xgb.Booster):
+            return self.xgb_model.predict(xgb.DMatrix(dataframe))
+        else:
+            return self.xgb_model.predict(dataframe)
 
 
-@experimental
 @autologging_integration(FLAVOR_NAME)
 def autolog(
     importance_types=None,
@@ -361,6 +381,7 @@ def autolog(
                    autologging. If ``False``, show all events and warnings during XGBoost
                    autologging.
     """
+    import functools
     import xgboost
     import numpy as np
 
@@ -398,51 +419,23 @@ def autolog(
             """
             # TODO: Remove `replace("SNAPSHOT", "dev")` once the following issue is addressed:
             #       https://github.com/dmlc/xgboost/issues/6984
-            if Version(xgboost.__version__.replace("SNAPSHOT", "dev")) >= Version("1.3.0"):
+            from mlflow.xgboost._autolog import IS_TRAINING_CALLBACK_SUPPORTED
+
+            if IS_TRAINING_CALLBACK_SUPPORTED:
+                from mlflow.xgboost._autolog import AutologCallback
+
                 # In xgboost >= 1.3.0, user-defined callbacks should inherit
                 # `xgboost.callback.TrainingCallback`:
-                # https://xgboost.readthedocs.io/en/latest/python/callbacks.html#defining-your-own-callback  # noqa
-
-                class Callback(
-                    xgboost.callback.TrainingCallback, metaclass=ExceptionSafeAbstractClass,
-                ):
-                    def after_iteration(self, model, epoch, evals_log):
-                        """
-                        Run after each iteration. Return True when training should stop.
-                        """
-                        # `evals_log` is a nested dict (type: Dict[str, Dict[str, List[float]]])
-                        # that looks like this:
-                        # {
-                        #   "train": {
-                        #     "auc": [0.5, 0.6, 0.7, ...],
-                        #     ...
-                        #   },
-                        #   ...
-                        # }
-                        evaluation_result_dict = {}
-                        for data_name, metric_dict in evals_log.items():
-                            for metric_name, metric_values_on_each_iter in metric_dict.items():
-                                key = "{}-{}".format(data_name, metric_name)
-                                # The last element in `metric_values_on_each_iter` corresponds to
-                                # the meric on the current iteration
-                                evaluation_result_dict[key] = metric_values_on_each_iter[-1]
-
-                        metrics_logger.record_metrics(evaluation_result_dict, epoch)
-                        eval_results.append(evaluation_result_dict)
-
-                        # Return `False` to indicate training should not stop
-                        return False
-
-                return Callback()
-
+                # https://xgboost.readthedocs.io/en/latest/python/callbacks.html#defining-your-own-callback
+                return AutologCallback(metrics_logger, eval_results)
             else:
+                from mlflow.xgboost._autolog import autolog_callback
 
-                @exception_safe_function
-                def callback(env):
-                    metrics_logger.record_metrics(dict(env.evaluation_result_list), env.iteration)
-                    eval_results.append(dict(env.evaluation_result_list))
-
-                return callback
+                return picklable_exception_safe_function(
+                    functools.partial(
+                        autolog_callback, metrics_logger=metrics_logger, eval_results=eval_results
+                    )
+                )
 
         def log_feature_importance_plot(features, importance, importance_type):
             """
@@ -663,7 +656,10 @@ def autolog(
             )
 
             log_model(
-                model, artifact_path="model", signature=signature, input_example=input_example,
+                model,
+                artifact_path="model",
+                signature=signature,
+                input_example=input_example,
             )
 
         param_logging_operations.await_completion()

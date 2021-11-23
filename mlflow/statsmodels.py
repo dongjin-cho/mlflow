@@ -37,7 +37,6 @@ from mlflow.utils.file_utils import write_to
 from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
 from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.exceptions import MlflowException
-from mlflow.utils.annotations import experimental
 from mlflow.utils.autologging_utils import (
     log_fn_args_as_params,
     autologging_integration,
@@ -173,13 +172,17 @@ def save_model(
             # To ensure `_load_pyfunc` can successfully load the model during the dependency
             # inference, `mlflow_model.save` must be called beforehand to save an MLmodel file.
             inferred_reqs = mlflow.models.infer_pip_requirements(
-                path, FLAVOR_NAME, fallback=default_reqs,
+                path,
+                FLAVOR_NAME,
+                fallback=default_reqs,
             )
             default_reqs = sorted(set(inferred_reqs).union(default_reqs))
         else:
             default_reqs = None
         conda_env, pip_requirements, pip_constraints = _process_pip_requirements(
-            default_reqs, pip_requirements, extra_pip_requirements,
+            default_reqs,
+            pip_requirements,
+            extra_pip_requirements,
         )
     else:
         conda_env, pip_requirements, pip_constraints = _process_conda_env(conda_env)
@@ -384,7 +387,6 @@ def _get_autolog_metrics(fitted_model):
     return result_metrics
 
 
-@experimental
 @autologging_integration(FLAVOR_NAME)
 def autolog(
     log_models=True,
