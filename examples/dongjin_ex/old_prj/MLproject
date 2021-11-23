@@ -1,10 +1,8 @@
-name: tutorial
-
+name: dongjin_ex
 conda_env: conda.yaml
-
 entry_points:
   main:
     parameters:
       alpha: {type: float, default: 0.5}
       l1_ratio: {type: float, default: 0.1}
-    command: "python3 train.py {alpha} {l1_ratio}"
+    command: "python wine.py {alpha} {l1_ratio}"
